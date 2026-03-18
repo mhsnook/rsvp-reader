@@ -7,8 +7,7 @@ import {
 	type ChangeEvent,
 	type DragEvent,
 } from 'react'
-import { getORP, hasLongNumber, tokenize } from './tokenizer'
-import type { ORPParts } from './tokenizer'
+import { getORP, tokenize } from './tokenizer'
 
 declare global {
 	interface Window {
@@ -127,13 +126,6 @@ function loadText(hash: string): string | null {
 	}
 }
 
-function deleteText(hash: string) {
-	try {
-		const all = JSON.parse(localStorage.getItem(LS_TEXT_KEY) || '{}')
-		delete all[hash]
-		localStorage.setItem(LS_TEXT_KEY, JSON.stringify(all))
-	} catch {}
-}
 
 function loadTheme(): 'light' | 'dark' {
 	try {
@@ -511,10 +503,6 @@ export default function RSVPReader() {
 	const wordOpensQuote = /^[""'«]/.test(currentWord)
 	const wordClosesQuote = /[""'»]$/.test(currentWord)
 
-	const ctxStart = Math.max(0, idx - 40)
-	const ctxEnd = Math.min(words.length, idx + 80)
-	const ctxWords = words.slice(ctxStart, ctxEnd)
-	const ctxLocal = idx - ctxStart
 
 	// Compute sentence boundaries for sidebar navigation
 	const sentences = useMemo(() => {
