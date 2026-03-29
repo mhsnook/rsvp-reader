@@ -334,6 +334,7 @@ export default function RSVPReader() {
 	const [font, setFont] = useState<FontChoice>('mono')
 	const [showFontPicker, setShowFontPicker] = useState(false)
 	const [jumpInput, setJumpInput] = useState<string | null>(null)
+	const [focusMode, setFocusMode] = useState(false)
 	const fileInputRef = useRef<HTMLInputElement>(null)
 	const idxRef = useRef(idx)
 	idxRef.current = idx
@@ -419,10 +420,18 @@ export default function RSVPReader() {
 				e.preventDefault()
 				setWpm((w) => Math.max(80, w - 20))
 			}
+			if (e.key === 'f' || e.key === 'F') {
+				e.preventDefault()
+				setFocusMode((f) => !f)
+			}
+			if (e.code === 'Escape' && focusMode) {
+				e.preventDefault()
+				setFocusMode(false)
+			}
 		}
 		window.addEventListener('keydown', handler)
 		return () => window.removeEventListener('keydown', handler)
-	}, [screen, rewind, forward])
+	}, [screen, rewind, forward, focusMode])
 
 	useEffect(() => {
 		if (!playing || words.length === 0) return
@@ -491,6 +500,7 @@ export default function RSVPReader() {
 		}
 		setScreen('input')
 		setPlaying(false)
+		setFocusMode(false)
 		setSavedTexts(loadPositions())
 	}
 
@@ -842,11 +852,14 @@ export default function RSVPReader() {
 	return (
 		<div
 			className={`${c.bg} ${c.text} font-sans h-screen overflow-hidden transition-colors duration-300 grid
-				grid-cols-1 grid-rows-[auto_auto_1fr_auto_auto]
-				md:grid-cols-[160px_1fr_220px] md:grid-rows-[1fr_64px]`}
+				${focusMode
+					? 'grid-cols-1 grid-rows-1'
+					: `grid-cols-1 grid-rows-[auto_auto_1fr_auto_auto]
+					   md:grid-cols-[160px_1fr_220px] md:grid-rows-[1fr_64px]`
+				}`}
 		>
 			{/* Progress panel: horizontal strip on mobile, vertical sidebar on desktop */}
-			<div
+			{!focusMode && <div
 				className={`
 					border-b md:border-b-0 md:border-r ${c.border}
 					px-4 py-2 md:p-5
@@ -948,10 +961,15 @@ export default function RSVPReader() {
 						~{minsLeft < 1 ? '<1' : minsLeft}m left @ {wpm}wpm
 					</p>
 				</div>
-			</div>
+			</div>}
 
 			{/* Center: reader with focus guides */}
-			<div className="flex flex-col items-center justify-center relative order-3 md:order-none min-h-[200px]">
+			<div
+				className={`flex flex-col items-center justify-center relative ${
+					focusMode ? 'w-full h-full' : 'order-3 md:order-none min-h-[200px] cursor-pointer'
+				}`}
+				onClick={() => { if (!focusMode) setFocusMode(true) }}
+			>
 				{/* Focus guides: horizontal rails + vertical ORP line */}
 				<div
 					className="absolute pointer-events-none"
@@ -1098,17 +1116,57 @@ export default function RSVPReader() {
 				</div>
 
 				{/* Text name */}
-				{textName && (
+				{textName && !focusMode && (
 					<p
 						className={`absolute bottom-4 text-[11px] ${c.textFaint} truncate max-w-xs`}
 					>
 						{textName}
 					</p>
 				)}
+
+				{/* Floating controls in focus mode */}
+				{focusMode && (
+					<div
+						className="absolute bottom-4 left-4 flex items-center gap-2 z-30"
+						onClick={(e) => e.stopPropagation()}
+					>
+						<button
+							onClick={handleBack}
+							className={`border ${c.btnBorder} ${c.btnText} rounded-md px-3 py-1.5 text-xs cursor-pointer font-sans ${c.btnHoverBorder} ${c.btnHoverText}`}
+						>
+							← back
+						</button>
+						<button
+							onClick={rewind}
+							className={`border ${c.btnBorder} ${c.btnText} rounded-md px-3 py-1.5 text-xs cursor-pointer font-sans ${c.btnHoverBorder} ${c.btnHoverText}`}
+						>
+							↩ 5s
+						</button>
+						<button
+							onClick={() => setPlaying((p) => !p)}
+							className="bg-amber-500 text-white rounded-md px-5 py-1.5 text-sm font-bold cursor-pointer min-w-[72px] hover:bg-amber-600"
+						>
+							{playing ? '⏸' : '▶'}
+						</button>
+						<button
+							onClick={forward}
+							className={`border ${c.btnBorder} ${c.btnText} rounded-md px-3 py-1.5 text-xs cursor-pointer font-sans ${c.btnHoverBorder} ${c.btnHoverText}`}
+						>
+							5s ↪
+						</button>
+						<button
+							onClick={() => setFocusMode(false)}
+							className={`border ${c.btnBorder} ${c.btnText} rounded-md px-3 py-1.5 text-xs cursor-pointer font-sans ${c.btnHoverBorder} ${c.btnHoverText} ml-2`}
+							title="Exit focus mode (f)"
+						>
+							✕
+						</button>
+					</div>
+				)}
 			</div>
 
 			{/* Sentence navigation: horizontal scroll on mobile, vertical sidebar on desktop */}
-			<div
+			{!focusMode && <div
 				className={`
 					border-t md:border-t-0 md:border-l ${c.border}
 					px-3 py-2 md:p-3
@@ -1178,10 +1236,10 @@ export default function RSVPReader() {
 						)
 					})}
 				</div>
-			</div>
+			</div>}
 
 			{/* Controls bar */}
-			<div
+			{!focusMode && <div
 				className={`flex flex-wrap items-center gap-2 md:gap-4 px-3 md:px-6 py-2 md:py-0 border-t ${c.border} ${c.controlsBg} order-4 md:order-none md:col-span-3`}
 			>
 				<button
@@ -1253,9 +1311,9 @@ export default function RSVPReader() {
 				<p
 					className={`hidden md:block ml-auto text-[11px] ${c.textFaint} tracking-wide`}
 				>
-					space · pause &nbsp;·&nbsp; ←→ skip &nbsp;·&nbsp; ↑↓ speed
+					space · pause &nbsp;·&nbsp; ←→ skip &nbsp;·&nbsp; ↑↓ speed &nbsp;·&nbsp; f focus
 				</p>
-			</div>
+			</div>}
 		</div>
 	)
 }
