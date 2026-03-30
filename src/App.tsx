@@ -8,6 +8,7 @@ import {
 	type DragEvent,
 } from 'react'
 import { getORP, tokenize } from './tokenizer'
+import { extractEpubContent, type Chapter } from './extractEpubText'
 
 declare global {
 	interface Window {
@@ -65,6 +66,7 @@ const LS_KEY = 'rsvp-reading-positions'
 const LS_TEXT_KEY = 'rsvp-texts'
 const LS_THEME_KEY = 'rsvp-theme'
 const LS_FONT_KEY = 'rsvp-font'
+const LS_CHAPTERS_KEY = 'rsvp-chapters'
 
 type Screen = 'input' | 'read'
 
@@ -126,6 +128,24 @@ function loadText(hash: string): string | null {
 	}
 }
 
+
+function saveChapters(hash: string, chapters: Chapter[]) {
+	if (chapters.length === 0) return
+	try {
+		const all = JSON.parse(localStorage.getItem(LS_CHAPTERS_KEY) || '{}')
+		all[hash] = chapters
+		localStorage.setItem(LS_CHAPTERS_KEY, JSON.stringify(all))
+	} catch {}
+}
+
+function loadChapters(hash: string): Chapter[] {
+	try {
+		const all = JSON.parse(localStorage.getItem(LS_CHAPTERS_KEY) || '{}')
+		return all[hash] || []
+	} catch {
+		return []
+	}
+}
 
 function loadTheme(): 'light' | 'dark' {
 	try {
@@ -334,6 +354,8 @@ export default function RSVPReader() {
 	const [font, setFont] = useState<FontChoice>('mono')
 	const [showFontPicker, setShowFontPicker] = useState(false)
 	const [jumpInput, setJumpInput] = useState<string | null>(null)
+	const [chapters, setChapters] = useState<Chapter[]>([])
+	const [chapterTitle, setChapterTitle] = useState<string | null>(null)
 	const fileInputRef = useRef<HTMLInputElement>(null)
 	const idxRef = useRef(idx)
 	idxRef.current = idx
@@ -401,14 +423,21 @@ export default function RSVPReader() {
 		const handler = (e: globalThis.KeyboardEvent) => {
 			if (e.code === 'Space') {
 				e.preventDefault()
-				setPlaying((p) => !p)
+				if (chapterTitle !== null) {
+					setChapterTitle(null)
+					setPlaying(true)
+				} else {
+					setPlaying((p) => !p)
+				}
 			}
 			if (e.code === 'ArrowLeft') {
 				e.preventDefault()
+				setChapterTitle(null)
 				rewind()
 			}
 			if (e.code === 'ArrowRight') {
 				e.preventDefault()
+				setChapterTitle(null)
 				forward()
 			}
 			if (e.code === 'ArrowUp') {
@@ -422,10 +451,21 @@ export default function RSVPReader() {
 		}
 		window.addEventListener('keydown', handler)
 		return () => window.removeEventListener('keydown', handler)
-	}, [screen, rewind, forward])
+	}, [screen, rewind, forward, chapterTitle])
 
 	useEffect(() => {
 		if (!playing || words.length === 0) return
+
+		// Check if next word is a chapter boundary
+		const nextIdx = idx + 1
+		const chapterHit = chapters.find((ch) => ch.startIdx === nextIdx)
+		if (chapterHit) {
+			setIdx(nextIdx)
+			setPlaying(false)
+			setChapterTitle(chapterHit.title)
+			return
+		}
+
 		const baseMs = 60000 / wpm
 		const wordDelay = baseMs * (delays[idx] || 1)
 		const id = setTimeout(() => {
@@ -438,32 +478,41 @@ export default function RSVPReader() {
 			})
 		}, wordDelay)
 		return () => clearTimeout(id)
-	}, [playing, wpm, words.length, idx, delays])
+	}, [playing, wpm, words.length, idx, delays, chapters])
 
 	const startReading = useCallback(
-		(text: string, name: string) => {
+		(text: string, name: string, chaps?: Chapter[]) => {
 			const { words: w, delays: d, quoteDepth: q } = tokenize(text)
 			if (w.length === 0) return
 			const hash = hashText(w)
 			const saved = loadPositions()[hash]
+			const resolvedChaps = chaps || loadChapters(hash)
 
 			setWords(w)
 			setDelays(d)
 			setQuoteDepths(q)
 			setTextName(name)
 			setTextHash(hash)
+			setChapters(resolvedChaps)
 			setPlaying(false)
 			setScreen('read')
 
-			if (saved && saved.idx > 0 && saved.idx < w.length) {
-				setIdx(saved.idx)
-				setWpm(saved.wpm)
+			const resumeIdx =
+				saved && saved.idx > 0 && saved.idx < w.length ? saved.idx : 0
+			if (resumeIdx > 0) {
+				setIdx(resumeIdx)
+				setWpm(saved!.wpm)
+				setChapterTitle(null)
 			} else {
 				setIdx(0)
+				// Show first chapter interstitial if chapters start at word 0
+				const firstChapter = resolvedChaps.find((ch) => ch.startIdx === 0)
+				setChapterTitle(firstChapter ? firstChapter.title : null)
 			}
 
-			savePosition(hash, name, saved?.idx || 0, saved?.wpm || wpm, w.length)
+			savePosition(hash, name, resumeIdx, saved?.wpm || wpm, w.length)
 			saveText(hash, text)
+			if (chaps && chaps.length > 0) saveChapters(hash, chaps)
 			setSavedTexts(loadPositions())
 		},
 		[wpm],
@@ -473,11 +522,19 @@ export default function RSVPReader() {
 		if (!file) return
 		setLoading(true)
 		try {
-			const text =
-				file.type === 'application/pdf'
-					? await extractPdfText(file)
-					: await file.text()
-			startReading(text, file.name)
+			const isEpub =
+				file.type === 'application/epub+zip' ||
+				file.name.toLowerCase().endsWith('.epub')
+			if (isEpub) {
+				const { text, chapters: chaps } = await extractEpubContent(file)
+				startReading(text, file.name, chaps)
+			} else {
+				const text =
+					file.type === 'application/pdf'
+						? await extractPdfText(file)
+						: await file.text()
+				startReading(text, file.name)
+			}
 		} catch (e) {
 			alert('Could not read file: ' + (e as Error).message)
 		} finally {
@@ -748,13 +805,13 @@ export default function RSVPReader() {
 										: 'Drop file or click to select'}
 								</p>
 								<p className={`${c.textMuted} text-xs mt-0.5`}>
-									.pdf · .txt · .md
+									.pdf · .txt · .md · .epub
 								</p>
 							</div>
 							<input
 								ref={fileInputRef}
 								type="file"
-								accept=".pdf,.txt,.md"
+								accept=".pdf,.txt,.md,.epub"
 								onChange={(e: ChangeEvent<HTMLInputElement>) =>
 									handleFile(e.target.files?.[0])
 								}
@@ -845,6 +902,36 @@ export default function RSVPReader() {
 				grid-cols-1 grid-rows-[auto_auto_1fr_auto_auto]
 				md:grid-cols-[160px_1fr_220px] md:grid-rows-[1fr_64px]`}
 		>
+			{/* Chapter interstitial overlay */}
+			{chapterTitle !== null && (
+				<div
+					className="fixed inset-0 z-40 flex flex-col items-center justify-center cursor-pointer"
+					style={{
+						background: dark
+							? 'rgba(0,0,0,0.92)'
+							: 'rgba(255,255,255,0.95)',
+					}}
+					onClick={() => {
+						setChapterTitle(null)
+						setPlaying(true)
+					}}
+				>
+					<p
+						className={`text-xs tracking-[0.3em] uppercase ${c.textMuted} mb-4`}
+					>
+						Chapter
+					</p>
+					<h2
+						className={`text-3xl md:text-5xl font-bold ${c.textStrong} text-center px-8 max-w-lg`}
+						style={{ fontFamily: fc.family }}
+					>
+						{chapterTitle}
+					</h2>
+					<p className={`mt-8 text-sm ${c.textFaint}`}>
+						Press Space or tap to continue
+					</p>
+				</div>
+			)}
 			{/* Progress panel: horizontal strip on mobile, vertical sidebar on desktop */}
 			<div
 				className={`
@@ -1128,8 +1215,19 @@ export default function RSVPReader() {
 					{sentences.map((s, i) => {
 						const isCurrent = i === currentSentenceIdx
 						const isPast = i < currentSentenceIdx
+						const chapterLabel = chapters.find(
+							(ch) =>
+								ch.startIdx >= s.start &&
+								ch.startIdx <
+									(sentences[i + 1]?.start ?? words.length),
+						)
 						return (
 							<div key={s.start} className="relative">
+								{chapterLabel && (
+									<p className="text-[9px] tracking-[0.2em] text-amber-600 uppercase mt-2 mb-1 px-2 truncate hidden md:block">
+										{chapterLabel.title}
+									</p>
+								)}
 								<button
 									data-active={isCurrent}
 									onClick={() => {
@@ -1197,7 +1295,14 @@ export default function RSVPReader() {
 					↩ 5s
 				</button>
 				<button
-					onClick={() => setPlaying((p) => !p)}
+					onClick={() => {
+						if (chapterTitle !== null) {
+							setChapterTitle(null)
+							setPlaying(true)
+						} else {
+							setPlaying((p) => !p)
+						}
+					}}
 					className="bg-amber-500 text-white rounded-md px-5 py-1.5 text-sm font-bold cursor-pointer min-w-[72px] hover:bg-amber-600"
 				>
 					{playing ? '⏸' : '▶'}
