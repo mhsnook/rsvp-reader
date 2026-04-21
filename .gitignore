@@ -12,6 +12,7 @@ package-lock.json
 dist
 dist-ssr
 *.local
+.wrangler
 
 # Editor directories and files
 .vscode/*
