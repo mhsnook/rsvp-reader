@@ -32,8 +32,7 @@ declare global {
 }
 
 const FONT_URLS = [
-	'https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&display=swap',
-	'https://fonts.cdnfonts.com/css/open-dyslexic',
+	'https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Lexend:wght@400;700&display=swap',
 ]
 
 type FontChoice = 'mono' | 'serif' | 'dyslexic'
@@ -55,7 +54,7 @@ const FONT_CONFIG: Record<
 		orpWidth: 6,
 	},
 	dyslexic: {
-		family: "'Open Dyslexic', 'OpenDyslexic', sans-serif",
+		family: "'Lexend', sans-serif",
 		label: 'Dyslexia-friendly',
 		orpWidth: 6,
 	},
