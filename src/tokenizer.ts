@@ -181,3 +181,92 @@ export function tokenize(text: string): {
 
 	return { words, delays, quoteDepth }
 }
+
+export interface Chunk {
+	text: string
+	startIdx: number
+	wordCount: number
+	delay: number
+}
+
+/**
+ * Group words into phrase-sized chunks for multi-word reading modes.
+ *
+ * Soft target with lookahead: aim for `targetSize` words per chunk, but
+ * prefer to break at natural boundaries (commas ≥ 1.3, sentence ends ≥ 1.8,
+ * paragraph breaks ≥ 4). Sentence and paragraph breaks are hard — a chunk
+ * never spans them. Commas are soft — we close at one if we're at least
+ * halfway to the target, or extend up to `LOOKAHEAD` words past the target
+ * to catch one.
+ *
+ * Chunk `delay` is the sum of the constituent per-word delays, so playback
+ * time scales with word count and picks up punctuation pauses for free.
+ */
+export function chunkWords(
+	words: string[],
+	delays: number[],
+	targetSize: number,
+): Chunk[] {
+	if (targetSize <= 1 || words.length === 0) {
+		return words.map((w, i) => ({
+			text: w,
+			startIdx: i,
+			wordCount: 1,
+			delay: delays[i] ?? 1,
+		}))
+	}
+
+	const HARD = 1.8
+	const SOFT = 1.3
+	const LOOKAHEAD = 3
+	const softFloor = Math.ceil(targetSize / 2)
+
+	const chunks: Chunk[] = []
+	let i = 0
+	while (i < words.length) {
+		let end = i
+		let delaySum = 0
+		while (end < words.length) {
+			const d = delays[end] ?? 1
+			delaySum += d
+			const len = end - i + 1
+
+			if (d >= HARD) {
+				end++
+				break
+			}
+
+			if (len >= targetSize) {
+				let extended = false
+				const stopAt = Math.min(end + 1 + LOOKAHEAD, words.length)
+				for (let k = end + 1; k < stopAt; k++) {
+					const dk = delays[k] ?? 1
+					if (dk >= SOFT) {
+						for (let j = end + 1; j <= k; j++) delaySum += delays[j] ?? 1
+						end = k + 1
+						extended = true
+						break
+					}
+					if (dk >= HARD) break
+				}
+				if (!extended) end++
+				break
+			}
+
+			if (d >= SOFT && len >= softFloor) {
+				end++
+				break
+			}
+
+			end++
+		}
+		chunks.push({
+			text: words.slice(i, end).join(' '),
+			startIdx: i,
+			wordCount: end - i,
+			delay: delaySum,
+		})
+		i = end
+	}
+	return chunks
+}

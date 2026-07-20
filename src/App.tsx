@@ -7,7 +7,7 @@ import {
 	type ChangeEvent,
 	type DragEvent,
 } from 'react'
-import { getORP, tokenize } from './tokenizer'
+import { chunkWords, getORP, tokenize } from './tokenizer'
 import { extractEpubContent, type Chapter } from './extractEpubText'
 
 declare global {
@@ -65,6 +65,9 @@ const LS_KEY = 'rsvp-reading-positions'
 const LS_TEXT_KEY = 'rsvp-texts'
 const LS_THEME_KEY = 'rsvp-theme'
 const LS_FONT_KEY = 'rsvp-font'
+const LS_CHUNK_KEY = 'rsvp-chunk-size'
+
+const CHUNK_SIZES = [1, 2, 3, 5, 8, 12] as const
 const LS_CHAPTERS_KEY = 'rsvp-chapters'
 
 type Screen = 'input' | 'read'
@@ -161,6 +164,14 @@ function loadFont(): FontChoice {
 		if (v === 'mono' || v === 'serif' || v === 'dyslexic') return v
 	} catch {}
 	return 'mono'
+}
+
+function loadChunkSize(): number {
+	try {
+		const v = parseInt(localStorage.getItem(LS_CHUNK_KEY) || '', 10)
+		if (CHUNK_SIZES.includes(v as (typeof CHUNK_SIZES)[number])) return v
+	} catch {}
+	return 1
 }
 
 async function loadPdfJs(): Promise<Window['pdfjsLib']> {
@@ -352,6 +363,7 @@ export default function RSVPReader() {
 	const [dark, setDark] = useState(false)
 	const [font, setFont] = useState<FontChoice>('mono')
 	const [showFontPicker, setShowFontPicker] = useState(false)
+	const [chunkSize, setChunkSize] = useState<number>(1)
 	const [jumpInput, setJumpInput] = useState<string | null>(null)
 	const [chapters, setChapters] = useState<Chapter[]>([])
 	const [chapterTitle, setChapterTitle] = useState<string | null>(null)
@@ -390,6 +402,14 @@ export default function RSVPReader() {
 		setSavedTexts(loadPositions())
 		setDark(loadTheme() === 'dark')
 		setFont(loadFont())
+		setChunkSize(loadChunkSize())
+	}, [])
+
+	const pickChunkSize = useCallback((n: number) => {
+		setChunkSize(n)
+		try {
+			localStorage.setItem(LS_CHUNK_KEY, String(n))
+		} catch {}
 	}, [])
 
 	useEffect(() => {
@@ -461,32 +481,65 @@ export default function RSVPReader() {
 		return () => window.removeEventListener('keydown', handler)
 	}, [screen, rewind, forward, chapterTitle, focusMode])
 
-	useEffect(() => {
-		if (!playing || words.length === 0) return
+	const chunks = useMemo(
+		() => chunkWords(words, delays, chunkSize),
+		[words, delays, chunkSize],
+	)
 
-		// Check if next word is a chapter boundary
-		const nextIdx = idx + 1
-		const chapterHit = chapters.find((ch) => ch.startIdx === nextIdx)
-		if (chapterHit) {
-			setIdx(nextIdx)
-			setPlaying(false)
-			setChapterTitle(chapterHit.title)
-			return
+	// Word idx → chunk index in `chunks`. Built once per chunking pass.
+	const wordToChunk = useMemo(() => {
+		const map = new Int32Array(words.length)
+		for (let ci = 0; ci < chunks.length; ci++) {
+			const ch = chunks[ci]
+			for (let w = ch.startIdx; w < ch.startIdx + ch.wordCount; w++) {
+				map[w] = ci
+			}
+		}
+		return map
+	}, [chunks, words.length])
+
+	const currentChunkIdx = chunks.length > 0 ? wordToChunk[idx] ?? 0 : 0
+	const currentChunk = chunks[currentChunkIdx]
+
+	useEffect(() => {
+		if (!playing || chunks.length === 0 || !currentChunk) return
+
+		const nextChunk = chunks[currentChunkIdx + 1]
+		const nextIdx = nextChunk ? nextChunk.startIdx : words.length
+
+		// Pause on chapter boundary — next chunk starts a new chapter.
+		if (nextChunk) {
+			const chapterHit = chapters.find((ch) => ch.startIdx === nextChunk.startIdx)
+			if (chapterHit) {
+				const id = setTimeout(() => {
+					setIdx(nextChunk.startIdx)
+					setPlaying(false)
+					setChapterTitle(chapterHit.title)
+				}, (60000 / wpm) * currentChunk.delay)
+				return () => clearTimeout(id)
+			}
 		}
 
 		const baseMs = 60000 / wpm
-		const wordDelay = baseMs * (delays[idx] || 1)
+		const chunkMs = baseMs * currentChunk.delay
 		const id = setTimeout(() => {
-			setIdx((i) => {
-				if (i >= words.length - 1) {
-					setPlaying(false)
-					return i
-				}
-				return i + 1
-			})
-		}, wordDelay)
+			if (nextIdx >= words.length) {
+				setPlaying(false)
+				setIdx(words.length - 1)
+			} else {
+				setIdx(nextIdx)
+			}
+		}, chunkMs)
 		return () => clearTimeout(id)
-	}, [playing, wpm, words.length, idx, delays, chapters])
+	}, [
+		playing,
+		wpm,
+		words.length,
+		currentChunkIdx,
+		currentChunk,
+		chunks,
+		chapters,
+	])
 
 	const startReading = useCallback(
 		(text: string, name: string, chaps?: Chapter[]) => {
@@ -1172,34 +1225,55 @@ export default function RSVPReader() {
 							&rdquo;
 						</div>
 					)}
-					<div
-						className="absolute"
-						style={{
-							left: '50%',
-							top: '50%',
-							transform: `translate(-${fc.orpWidth + 0.5}ch, -50%)`,
-							fontFamily: fc.family,
-							fontSize: 'clamp(2rem, 5vw, 3.5rem)',
-							fontWeight: 700,
-							lineHeight: '4.5rem',
-							whiteSpace: 'pre',
-							userSelect: 'none',
-						}}
-					>
-						<span
-							className={`inline-block text-right ${c.beforeText}`}
-							style={{ width: `${fc.orpWidth}ch` }}
+					{chunkSize === 1 ? (
+						<div
+							className="absolute"
+							style={{
+								left: '50%',
+								top: '50%',
+								transform: `translate(-${fc.orpWidth + 0.5}ch, -50%)`,
+								fontFamily: fc.family,
+								fontSize: 'clamp(2rem, 5vw, 3.5rem)',
+								fontWeight: 700,
+								lineHeight: '4.5rem',
+								whiteSpace: 'pre',
+								userSelect: 'none',
+							}}
 						>
-							{before}
-						</span>
-						<span
-							className="text-amber-500"
-							style={{ textShadow: c.orpShadow }}
+							<span
+								className={`inline-block text-right ${c.beforeText}`}
+								style={{ width: `${fc.orpWidth}ch` }}
+							>
+								{before}
+							</span>
+							<span
+								className="text-amber-500"
+								style={{ textShadow: c.orpShadow }}
+							>
+								{orp}
+							</span>
+							<span className={c.afterText}>{after}</span>
+						</div>
+					) : (
+						<div
+							className={`absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 text-center px-6 ${c.afterText}`}
+							style={{
+								fontFamily: fc.family,
+								fontSize:
+									currentChunk && currentChunk.wordCount >= 8
+										? 'clamp(1rem, 2.5vw, 1.75rem)'
+										: currentChunk && currentChunk.wordCount >= 4
+											? 'clamp(1.25rem, 3vw, 2.25rem)'
+											: 'clamp(1.5rem, 3.5vw, 2.75rem)',
+								fontWeight: 700,
+								lineHeight: 1.2,
+								maxWidth: '90vw',
+								userSelect: 'none',
+							}}
 						>
-							{orp}
-						</span>
-						<span className={c.afterText}>{after}</span>
-					</div>
+							{currentChunk?.text || ''}
+						</div>
+					)}
 				</div>
 
 				{/* Text name */}
@@ -1385,6 +1459,26 @@ export default function RSVPReader() {
 						onChange={(e) => setWpm(Number(e.target.value))}
 						className="flex-1 accent-amber-500 h-1"
 					/>
+				</div>
+
+				<div
+					className={`flex items-center gap-1 ${c.textMuted} text-[11px]`}
+					title="Words per chunk"
+				>
+					<span className="hidden sm:inline mr-1">chunk</span>
+					{CHUNK_SIZES.map((n) => (
+						<button
+							key={n}
+							onClick={() => pickChunkSize(n)}
+							className={`w-6 h-6 rounded text-[11px] cursor-pointer transition-colors ${
+								chunkSize === n
+									? 'bg-amber-500 text-white font-bold'
+									: `${c.btnBorder} border ${c.btnText} ${c.btnHoverBorder} ${c.btnHoverText}`
+							}`}
+						>
+							{n}
+						</button>
+					))}
 				</div>
 
 				{fontButton}
