@@ -622,6 +622,19 @@ export default function RSVPReader() {
 	const wordOpensQuote = /^[""'«]/.test(currentWord)
 	const wordClosesQuote = /[""'»]$/.test(currentWord)
 
+	// Single-word ORP path: shrink font for unusually long words so they don't overrun.
+	const orpMaxRem = currentWord.length > 13 ? Math.max(1.4, (3.5 * 13) / currentWord.length) : 3.5
+	const orpFontSize = `clamp(1.4rem, 5vw, ${orpMaxRem}rem)`
+
+	// Chunk path: fix font size to the TARGET chunk size (not the actual wordCount of
+	// each chunk, which varies at phrase boundaries and causes jumping between frames).
+	const chunkFontSize =
+		chunkSize >= 8
+			? 'clamp(1rem, 2.5vw, 1.75rem)'
+			: chunkSize >= 4
+				? 'clamp(1.25rem, 3vw, 2.25rem)'
+				: 'clamp(1.5rem, 3.5vw, 2.75rem)'
+
 
 	// Compute sentence boundaries for sidebar navigation
 	const sentences = useMemo(() => {
@@ -1233,7 +1246,7 @@ export default function RSVPReader() {
 								top: '50%',
 								transform: `translate(-${fc.orpWidth + 0.5}ch, -50%)`,
 								fontFamily: fc.family,
-								fontSize: 'clamp(2rem, 5vw, 3.5rem)',
+								fontSize: orpFontSize,
 								fontWeight: 700,
 								lineHeight: '4.5rem',
 								whiteSpace: 'pre',
@@ -1259,12 +1272,7 @@ export default function RSVPReader() {
 							className={`absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 text-center px-6 ${c.afterText}`}
 							style={{
 								fontFamily: fc.family,
-								fontSize:
-									currentChunk && currentChunk.wordCount >= 8
-										? 'clamp(1rem, 2.5vw, 1.75rem)'
-										: currentChunk && currentChunk.wordCount >= 4
-											? 'clamp(1.25rem, 3vw, 2.25rem)'
-											: 'clamp(1.5rem, 3.5vw, 2.75rem)',
+								fontSize: chunkFontSize,
 								fontWeight: 700,
 								lineHeight: 1.2,
 								maxWidth: '90vw',
