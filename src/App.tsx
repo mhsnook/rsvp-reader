@@ -544,6 +544,7 @@ export default function RSVPReader() {
 	// Hovered sentence index for tooltip (null = no tooltip)
 	const [hoveredSentence, setHoveredSentence] = useState<number | null>(null)
 	const longPressTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+	const isTouchDevice = useMemo(() => navigator.maxTouchPoints > 0, [])
 
 	const getSentenceText = useCallback(
 		(sentIdx: number) => {
@@ -1307,11 +1308,13 @@ export default function RSVPReader() {
 					#{idx.toLocaleString()}
 				</span>
 
-				<p
-					className={`hidden md:block ml-auto text-[11px] ${c.textFaint} tracking-wide`}
-				>
-					space · pause &nbsp;·&nbsp; ←→ skip &nbsp;·&nbsp; ↑↓ speed &nbsp;·&nbsp; f focus
-				</p>
+				{!isTouchDevice && (
+					<p
+						className={`hidden md:block ml-auto text-[11px] ${c.textFaint} tracking-wide`}
+					>
+						space · pause &nbsp;·&nbsp; ←→ skip &nbsp;·&nbsp; ↑↓ speed &nbsp;·&nbsp; f focus
+					</p>
+				)}
 			</div>}
 		</div>
 	)
