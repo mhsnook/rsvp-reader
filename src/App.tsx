@@ -7,7 +7,8 @@ import {
 	type ChangeEvent,
 	type DragEvent,
 } from 'react'
-import { getORP, tokenize } from './tokenizer'
+import { chunkWords, getORP, tokenize } from './tokenizer'
+import { extractEpubContent, type Chapter } from './extractEpubText'
 
 declare global {
 	interface Window {
@@ -64,6 +65,10 @@ const LS_KEY = 'rsvp-reading-positions'
 const LS_TEXT_KEY = 'rsvp-texts'
 const LS_THEME_KEY = 'rsvp-theme'
 const LS_FONT_KEY = 'rsvp-font'
+const LS_CHUNK_KEY = 'rsvp-chunk-size'
+
+const CHUNK_SIZES = [1, 2, 3, 5, 8, 12] as const
+const LS_CHAPTERS_KEY = 'rsvp-chapters'
 
 type Screen = 'input' | 'read'
 
@@ -126,6 +131,24 @@ function loadText(hash: string): string | null {
 }
 
 
+function saveChapters(hash: string, chapters: Chapter[]) {
+	if (chapters.length === 0) return
+	try {
+		const all = JSON.parse(localStorage.getItem(LS_CHAPTERS_KEY) || '{}')
+		all[hash] = chapters
+		localStorage.setItem(LS_CHAPTERS_KEY, JSON.stringify(all))
+	} catch {}
+}
+
+function loadChapters(hash: string): Chapter[] {
+	try {
+		const all = JSON.parse(localStorage.getItem(LS_CHAPTERS_KEY) || '{}')
+		return all[hash] || []
+	} catch {
+		return []
+	}
+}
+
 function loadTheme(): 'light' | 'dark' {
 	try {
 		const v = localStorage.getItem(LS_THEME_KEY)
@@ -141,6 +164,14 @@ function loadFont(): FontChoice {
 		if (v === 'mono' || v === 'serif' || v === 'dyslexic') return v
 	} catch {}
 	return 'mono'
+}
+
+function loadChunkSize(): number {
+	try {
+		const v = parseInt(localStorage.getItem(LS_CHUNK_KEY) || '', 10)
+		if (CHUNK_SIZES.includes(v as (typeof CHUNK_SIZES)[number])) return v
+	} catch {}
+	return 1
 }
 
 async function loadPdfJs(): Promise<Window['pdfjsLib']> {
@@ -332,7 +363,10 @@ export default function RSVPReader() {
 	const [dark, setDark] = useState(false)
 	const [font, setFont] = useState<FontChoice>('mono')
 	const [showFontPicker, setShowFontPicker] = useState(false)
+	const [chunkSize, setChunkSize] = useState<number>(1)
 	const [jumpInput, setJumpInput] = useState<string | null>(null)
+	const [chapters, setChapters] = useState<Chapter[]>([])
+	const [chapterTitle, setChapterTitle] = useState<string | null>(null)
 	const [focusMode, setFocusMode] = useState(false)
 	const fileInputRef = useRef<HTMLInputElement>(null)
 	const idxRef = useRef(idx)
@@ -368,6 +402,14 @@ export default function RSVPReader() {
 		setSavedTexts(loadPositions())
 		setDark(loadTheme() === 'dark')
 		setFont(loadFont())
+		setChunkSize(loadChunkSize())
+	}, [])
+
+	const pickChunkSize = useCallback((n: number) => {
+		setChunkSize(n)
+		try {
+			localStorage.setItem(LS_CHUNK_KEY, String(n))
+		} catch {}
 	}, [])
 
 	useEffect(() => {
@@ -401,14 +443,21 @@ export default function RSVPReader() {
 		const handler = (e: globalThis.KeyboardEvent) => {
 			if (e.code === 'Space') {
 				e.preventDefault()
-				setPlaying((p) => !p)
+				if (chapterTitle !== null) {
+					setChapterTitle(null)
+					setPlaying(true)
+				} else {
+					setPlaying((p) => !p)
+				}
 			}
 			if (e.code === 'ArrowLeft') {
 				e.preventDefault()
+				setChapterTitle(null)
 				rewind()
 			}
 			if (e.code === 'ArrowRight') {
 				e.preventDefault()
+				setChapterTitle(null)
 				forward()
 			}
 			if (e.code === 'ArrowUp') {
@@ -430,48 +479,101 @@ export default function RSVPReader() {
 		}
 		window.addEventListener('keydown', handler)
 		return () => window.removeEventListener('keydown', handler)
-	}, [screen, rewind, forward, focusMode])
+	}, [screen, rewind, forward, chapterTitle, focusMode])
+
+	const chunks = useMemo(
+		() => chunkWords(words, delays, chunkSize),
+		[words, delays, chunkSize],
+	)
+
+	// Word idx → chunk index in `chunks`. Built once per chunking pass.
+	const wordToChunk = useMemo(() => {
+		const map = new Int32Array(words.length)
+		for (let ci = 0; ci < chunks.length; ci++) {
+			const ch = chunks[ci]
+			for (let w = ch.startIdx; w < ch.startIdx + ch.wordCount; w++) {
+				map[w] = ci
+			}
+		}
+		return map
+	}, [chunks, words.length])
+
+	const currentChunkIdx = chunks.length > 0 ? wordToChunk[idx] ?? 0 : 0
+	const currentChunk = chunks[currentChunkIdx]
 
 	useEffect(() => {
-		if (!playing || words.length === 0) return
-		const baseMs = 60000 / wpm
-		const wordDelay = baseMs * (delays[idx] || 1)
-		const id = setTimeout(() => {
-			setIdx((i) => {
-				if (i >= words.length - 1) {
+		if (!playing || chunks.length === 0 || !currentChunk) return
+
+		const nextChunk = chunks[currentChunkIdx + 1]
+		const nextIdx = nextChunk ? nextChunk.startIdx : words.length
+
+		// Pause on chapter boundary — next chunk starts a new chapter.
+		if (nextChunk) {
+			const chapterHit = chapters.find((ch) => ch.startIdx === nextChunk.startIdx)
+			if (chapterHit) {
+				const id = setTimeout(() => {
+					setIdx(nextChunk.startIdx)
 					setPlaying(false)
-					return i
-				}
-				return i + 1
-			})
-		}, wordDelay)
+					setChapterTitle(chapterHit.title)
+				}, (60000 / wpm) * currentChunk.delay)
+				return () => clearTimeout(id)
+			}
+		}
+
+		const baseMs = 60000 / wpm
+		const chunkMs = baseMs * currentChunk.delay
+		const id = setTimeout(() => {
+			if (nextIdx >= words.length) {
+				setPlaying(false)
+				setIdx(words.length - 1)
+			} else {
+				setIdx(nextIdx)
+			}
+		}, chunkMs)
 		return () => clearTimeout(id)
-	}, [playing, wpm, words.length, idx, delays])
+	}, [
+		playing,
+		wpm,
+		words.length,
+		currentChunkIdx,
+		currentChunk,
+		chunks,
+		chapters,
+	])
 
 	const startReading = useCallback(
-		(text: string, name: string) => {
+		(text: string, name: string, chaps?: Chapter[]) => {
 			const { words: w, delays: d, quoteDepth: q } = tokenize(text)
 			if (w.length === 0) return
 			const hash = hashText(w)
 			const saved = loadPositions()[hash]
+			const resolvedChaps = chaps || loadChapters(hash)
 
 			setWords(w)
 			setDelays(d)
 			setQuoteDepths(q)
 			setTextName(name)
 			setTextHash(hash)
+			setChapters(resolvedChaps)
 			setPlaying(false)
 			setScreen('read')
 
-			if (saved && saved.idx > 0 && saved.idx < w.length) {
-				setIdx(saved.idx)
-				setWpm(saved.wpm)
+			const resumeIdx =
+				saved && saved.idx > 0 && saved.idx < w.length ? saved.idx : 0
+			if (resumeIdx > 0) {
+				setIdx(resumeIdx)
+				setWpm(saved!.wpm)
+				setChapterTitle(null)
 			} else {
 				setIdx(0)
+				// Show first chapter interstitial if chapters start at word 0
+				const firstChapter = resolvedChaps.find((ch) => ch.startIdx === 0)
+				setChapterTitle(firstChapter ? firstChapter.title : null)
 			}
 
-			savePosition(hash, name, saved?.idx || 0, saved?.wpm || wpm, w.length)
+			savePosition(hash, name, resumeIdx, saved?.wpm || wpm, w.length)
 			saveText(hash, text)
+			if (chaps && chaps.length > 0) saveChapters(hash, chaps)
 			setSavedTexts(loadPositions())
 		},
 		[wpm],
@@ -481,11 +583,19 @@ export default function RSVPReader() {
 		if (!file) return
 		setLoading(true)
 		try {
-			const text =
-				file.type === 'application/pdf'
-					? await extractPdfText(file)
-					: await file.text()
-			startReading(text, file.name)
+			const isEpub =
+				file.type === 'application/epub+zip' ||
+				file.name.toLowerCase().endsWith('.epub')
+			if (isEpub) {
+				const { text, chapters: chaps } = await extractEpubContent(file)
+				startReading(text, file.name, chaps)
+			} else {
+				const text =
+					file.type === 'application/pdf'
+						? await extractPdfText(file)
+						: await file.text()
+				startReading(text, file.name)
+			}
 		} catch (e) {
 			alert('Could not read file: ' + (e as Error).message)
 		} finally {
@@ -544,6 +654,7 @@ export default function RSVPReader() {
 	// Hovered sentence index for tooltip (null = no tooltip)
 	const [hoveredSentence, setHoveredSentence] = useState<number | null>(null)
 	const longPressTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+	const isTouchDevice = useMemo(() => navigator.maxTouchPoints > 0, [])
 
 	const getSentenceText = useCallback(
 		(sentIdx: number) => {
@@ -757,13 +868,13 @@ export default function RSVPReader() {
 										: 'Drop file or click to select'}
 								</p>
 								<p className={`${c.textMuted} text-xs mt-0.5`}>
-									.pdf · .txt · .md
+									.pdf · .txt · .md · .epub
 								</p>
 							</div>
 							<input
 								ref={fileInputRef}
 								type="file"
-								accept=".pdf,.txt,.md"
+								accept=".pdf,.txt,.md,.epub"
 								onChange={(e: ChangeEvent<HTMLInputElement>) =>
 									handleFile(e.target.files?.[0])
 								}
@@ -857,6 +968,36 @@ export default function RSVPReader() {
 					   md:grid-cols-[160px_1fr_220px] md:grid-rows-[1fr_64px]`
 				}`}
 		>
+			{/* Chapter interstitial overlay */}
+			{chapterTitle !== null && (
+				<div
+					className="fixed inset-0 z-40 flex flex-col items-center justify-center cursor-pointer"
+					style={{
+						background: dark
+							? 'rgba(0,0,0,0.92)'
+							: 'rgba(255,255,255,0.95)',
+					}}
+					onClick={() => {
+						setChapterTitle(null)
+						setPlaying(true)
+					}}
+				>
+					<p
+						className={`text-xs tracking-[0.3em] uppercase ${c.textMuted} mb-4`}
+					>
+						Chapter
+					</p>
+					<h2
+						className={`text-3xl md:text-5xl font-bold ${c.textStrong} text-center px-8 max-w-lg`}
+						style={{ fontFamily: fc.family }}
+					>
+						{chapterTitle}
+					</h2>
+					<p className={`mt-8 text-sm ${c.textFaint}`}>
+						Press Space or tap to continue
+					</p>
+				</div>
+			)}
 			{/* Progress panel: horizontal strip on mobile, vertical sidebar on desktop */}
 			{!focusMode && <div
 				className={`
@@ -1084,34 +1225,55 @@ export default function RSVPReader() {
 							&rdquo;
 						</div>
 					)}
-					<div
-						className="absolute"
-						style={{
-							left: '50%',
-							top: '50%',
-							transform: `translate(-${fc.orpWidth + 0.5}ch, -50%)`,
-							fontFamily: fc.family,
-							fontSize: 'clamp(2rem, 5vw, 3.5rem)',
-							fontWeight: 700,
-							lineHeight: '4.5rem',
-							whiteSpace: 'pre',
-							userSelect: 'none',
-						}}
-					>
-						<span
-							className={`inline-block text-right ${c.beforeText}`}
-							style={{ width: `${fc.orpWidth}ch` }}
+					{chunkSize === 1 ? (
+						<div
+							className="absolute"
+							style={{
+								left: '50%',
+								top: '50%',
+								transform: `translate(-${fc.orpWidth + 0.5}ch, -50%)`,
+								fontFamily: fc.family,
+								fontSize: 'clamp(2rem, 5vw, 3.5rem)',
+								fontWeight: 700,
+								lineHeight: '4.5rem',
+								whiteSpace: 'pre',
+								userSelect: 'none',
+							}}
 						>
-							{before}
-						</span>
-						<span
-							className="text-amber-500"
-							style={{ textShadow: c.orpShadow }}
+							<span
+								className={`inline-block text-right ${c.beforeText}`}
+								style={{ width: `${fc.orpWidth}ch` }}
+							>
+								{before}
+							</span>
+							<span
+								className="text-amber-500"
+								style={{ textShadow: c.orpShadow }}
+							>
+								{orp}
+							</span>
+							<span className={c.afterText}>{after}</span>
+						</div>
+					) : (
+						<div
+							className={`absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 text-center px-6 ${c.afterText}`}
+							style={{
+								fontFamily: fc.family,
+								fontSize:
+									currentChunk && currentChunk.wordCount >= 8
+										? 'clamp(1rem, 2.5vw, 1.75rem)'
+										: currentChunk && currentChunk.wordCount >= 4
+											? 'clamp(1.25rem, 3vw, 2.25rem)'
+											: 'clamp(1.5rem, 3.5vw, 2.75rem)',
+								fontWeight: 700,
+								lineHeight: 1.2,
+								maxWidth: '90vw',
+								userSelect: 'none',
+							}}
 						>
-							{orp}
-						</span>
-						<span className={c.afterText}>{after}</span>
-					</div>
+							{currentChunk?.text || ''}
+						</div>
+					)}
 				</div>
 
 				{/* Text name */}
@@ -1185,8 +1347,19 @@ export default function RSVPReader() {
 					{sentences.map((s, i) => {
 						const isCurrent = i === currentSentenceIdx
 						const isPast = i < currentSentenceIdx
+						const chapterLabel = chapters.find(
+							(ch) =>
+								ch.startIdx >= s.start &&
+								ch.startIdx <
+									(sentences[i + 1]?.start ?? words.length),
+						)
 						return (
 							<div key={s.start} className="relative">
+								{chapterLabel && (
+									<p className="text-[9px] tracking-[0.2em] text-amber-600 uppercase mt-2 mb-1 px-2 truncate hidden md:block">
+										{chapterLabel.title}
+									</p>
+								)}
 								<button
 									data-active={isCurrent}
 									onClick={() => {
@@ -1254,7 +1427,14 @@ export default function RSVPReader() {
 					↩ 5s
 				</button>
 				<button
-					onClick={() => setPlaying((p) => !p)}
+					onClick={() => {
+						if (chapterTitle !== null) {
+							setChapterTitle(null)
+							setPlaying(true)
+						} else {
+							setPlaying((p) => !p)
+						}
+					}}
 					className="bg-amber-500 text-white rounded-md px-5 py-1.5 text-sm font-bold cursor-pointer min-w-[72px] hover:bg-amber-600"
 				>
 					{playing ? '⏸' : '▶'}
@@ -1279,6 +1459,26 @@ export default function RSVPReader() {
 						onChange={(e) => setWpm(Number(e.target.value))}
 						className="flex-1 accent-amber-500 h-1"
 					/>
+				</div>
+
+				<div
+					className={`flex items-center gap-1 ${c.textMuted} text-[11px]`}
+					title="Words per chunk"
+				>
+					<span className="hidden sm:inline mr-1">chunk</span>
+					{CHUNK_SIZES.map((n) => (
+						<button
+							key={n}
+							onClick={() => pickChunkSize(n)}
+							className={`w-6 h-6 rounded text-[11px] cursor-pointer transition-colors ${
+								chunkSize === n
+									? 'bg-amber-500 text-white font-bold'
+									: `${c.btnBorder} border ${c.btnText} ${c.btnHoverBorder} ${c.btnHoverText}`
+							}`}
+						>
+							{n}
+						</button>
+					))}
 				</div>
 
 				{fontButton}
@@ -1307,11 +1507,13 @@ export default function RSVPReader() {
 					#{idx.toLocaleString()}
 				</span>
 
-				<p
-					className={`hidden md:block ml-auto text-[11px] ${c.textFaint} tracking-wide`}
-				>
-					space · pause &nbsp;·&nbsp; ←→ skip &nbsp;·&nbsp; ↑↓ speed &nbsp;·&nbsp; f focus
-				</p>
+				{!isTouchDevice && (
+					<p
+						className={`hidden md:block ml-auto text-[11px] ${c.textFaint} tracking-wide`}
+					>
+						space · pause &nbsp;·&nbsp; ←→ skip &nbsp;·&nbsp; ↑↓ speed &nbsp;·&nbsp; f focus
+					</p>
+				)}
 			</div>}
 		</div>
 	)
