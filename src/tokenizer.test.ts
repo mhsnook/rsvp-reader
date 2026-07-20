@@ -1,5 +1,11 @@
 import { describe, it, expect } from 'vitest'
-import { getORP, hasLongNumber, smartifyQuotes, tokenize } from './tokenizer'
+import {
+	chunkWords,
+	getORP,
+	hasLongNumber,
+	smartifyQuotes,
+	tokenize,
+} from './tokenizer'
 
 describe('getORP', () => {
 	it('handles empty string', () => {
@@ -278,5 +284,62 @@ describe('tokenize', () => {
 			expect(quoteDepth[5]).toBe(0) // is
 			expect(quoteDepth[6]).toBe(0) // clean
 		})
+	})
+})
+
+describe('chunkWords', () => {
+	it('returns one chunk per word when target is 1', () => {
+		const { words, delays } = tokenize('the quick brown fox')
+		const chunks = chunkWords(words, delays, 1)
+		expect(chunks).toHaveLength(4)
+		expect(chunks.map((c) => c.text)).toEqual(['the', 'quick', 'brown', 'fox'])
+		expect(chunks.map((c) => c.wordCount)).toEqual([1, 1, 1, 1])
+	})
+
+	it('produces 10/6/9 for a 25-word sentence with commas at 10 and 16', () => {
+		// Sentence: 25 words, comma after word 10, comma after word 16, period at 25.
+		const parts: string[] = []
+		for (let i = 1; i <= 25; i++) {
+			let w = `w${i}`
+			if (i === 10 || i === 16) w += ','
+			if (i === 25) w += '.'
+			parts.push(w)
+		}
+		const { words, delays } = tokenize(parts.join(' '))
+		const chunks = chunkWords(words, delays, 10)
+		expect(chunks.map((c) => c.wordCount)).toEqual([10, 6, 9])
+	})
+
+	it('never spans a sentence boundary', () => {
+		const { words, delays } = tokenize(
+			'one two three four five. six seven eight nine ten.',
+		)
+		const chunks = chunkWords(words, delays, 8)
+		expect(chunks).toHaveLength(2)
+		expect(chunks[0].text).toBe('one two three four five.')
+		expect(chunks[1].text).toBe('six seven eight nine ten.')
+	})
+
+	it('closes at a comma just past target via lookahead', () => {
+		// Target 5, comma at word 6 — should extend from 5 to 6 to catch comma.
+		const { words, delays } = tokenize('a b c d e f, g h i j.')
+		const chunks = chunkWords(words, delays, 5)
+		expect(chunks[0].text).toBe('a b c d e f,')
+		expect(chunks[0].wordCount).toBe(6)
+	})
+
+	it('sums per-word delays into the chunk delay', () => {
+		const { words, delays } = tokenize('one two three four.')
+		const chunks = chunkWords(words, delays, 8)
+		expect(chunks).toHaveLength(1)
+		const expected = delays.reduce((s, d) => s + d, 0)
+		expect(chunks[0].delay).toBeCloseTo(expected, 5)
+	})
+
+	it('does not break on commas well below the soft floor', () => {
+		// Target 10, comma at word 2 — 2 < ceil(10/2)=5, should not close here.
+		const { words, delays } = tokenize('a b, c d e f g h i j k l.')
+		const chunks = chunkWords(words, delays, 10)
+		expect(chunks[0].wordCount).toBeGreaterThan(2)
 	})
 })
