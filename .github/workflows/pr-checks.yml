@@ -1,0 +1,258 @@
+# Delta-reporting PR checks.
+#
+# Shape: one job per TREE, not one per check. `head` and `base` each install
+# once and build once, then run every check that tree can answer. They run in
+# parallel with each other. `report` fans in, diffs the two, posts a single
+# comment, and owns the pass/fail decision.
+#
+# Total cost: 2 installs, 2 builds — whatever the number of checks.
+#
+# Checks taken here: build outcome, type errors, lint, bundle size, tests.
+# There is no formatter check: the repo has no formatter.
+
+name: PR checks
+
+on:
+  pull_request:
+    branches: [main]
+
+# Do not add a `push` trigger to this workflow. It compares two trees, and a
+# push has no base to compare against.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
+  # A cancelled run leaves its sticky comment describing an older commit, with
+  # no red X to explain why. Let a PR run finish.
+  cancel-in-progress: false
+
+# Every `run:` step gets `bash -eo pipefail`. The default shell is `bash -e`
+# with NO pipefail, so a piped step reports the LAST command's exit status:
+# `node gate.cjs | tee` means the gate can never fail the run, and
+# `pnpm build | tee` records a failed build as a success.
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # ── The PR's tree ─────────────────────────────────────────────────────
+  head:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      # pnpm/action-setup MUST come before setup-node: setup-node's `cache:
+      # pnpm` needs the pnpm binary to locate the store.
+      #
+      # No `version:` here. The action reads the `packageManager` field in
+      # package.json, so the version lives in one place.
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: "pnpm"
+
+      # `id` and the guard below: when the install fails, every later step is
+      # measuring nothing. Skip them rather than filling the report with the
+      # consequences of one failure.
+      - name: Install
+        id: install
+        run: pnpm install --frozen-lockfile
+
+      # Checks 1 and 2. They run concurrently inside the script.
+      #
+      # These run BEFORE the build and never depend on it. A branch that fails
+      # to build is the branch that most needs to hear about its type errors.
+      - name: Static checks
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: bash .github/ci/collect-static.sh /tmp/out/static
+
+      # `continue-on-error` and `tee`: a failed build is a finding to report,
+      # not a reason to lose the comment. The log feeds the Build section, which
+      # says whether this PR broke the build or inherited a broken base.
+      - name: Build
+        id: build
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        continue-on-error: true
+        run: |
+          mkdir -p /tmp/out
+          pnpm build 2>&1 | tee /tmp/out/build.log
+
+      - name: Record the build outcome
+        if: ${{ !cancelled() }}
+        run: |
+          mkdir -p /tmp/out
+          echo "${{ steps.build.outcome }}" >/tmp/out/build.outcome
+
+      # Check 4, head half. Measures only — the diff happens in `report`.
+      - name: Measure bundle
+        if: ${{ steps.build.outcome == 'success' }}
+        run: node .github/ci/measure-bundle.cjs dist /tmp/out/bundle.json
+
+      # Check 5. continue-on-error so a failure still reaches the comment.
+      - name: Tests
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        continue-on-error: true
+        run: pnpm test --reporter=json --outputFile=/tmp/test-results.json
+
+      - name: Render test fragment
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: |
+          node -e "require('./.github/ci/render-tests.cjs')({
+            results: '/tmp/test-results.json', out: '/tmp/out/fragments'
+          })"
+
+      - uses: actions/upload-artifact@v7
+        if: ${{ !cancelled() }}
+        with:
+          name: tree-head
+          path: /tmp/out/
+          retention-days: 1
+
+  # ── The base branch's tree ────────────────────────────────────────────
+  # Same install and build, but only the checks that need a comparison point.
+  # No tests here — that is a head-only question.
+  base:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.base_ref }}
+
+      # The toolchain versions are part of the measurement, exactly like the
+      # tool configs below, so both trees take them from head. This step also
+      # covers the bootstrap case: on the PR that first adds `.nvmrc` and the
+      # `packageManager` field, the base branch has neither, and the setup
+      # actions below would fail with nothing to read.
+      #
+      # package.json itself is NOT checked out. It carries the dependency list,
+      # and the base tree must install its own, or `--frozen-lockfile` fails on
+      # every PR that adds a dependency. Only the `packageManager` field is
+      # taken, through a copy that pnpm/action-setup reads instead.
+      - name: Fetch the toolchain versions from head
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          git fetch --no-tags --depth=1 origin "$HEAD_SHA"
+          git checkout "$HEAD_SHA" -- .nvmrc ||
+            echo "no .nvmrc on head, leaving the base copy in place"
+          mkdir -p .ci-toolchain
+          git show "$HEAD_SHA":package.json >.ci-toolchain/package.json
+
+      - uses: pnpm/action-setup@v6
+        with:
+          package_json_file: .ci-toolchain/package.json
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: "pnpm"
+
+      - name: Install
+        id: install
+        run: pnpm install --frozen-lockfile
+
+      # The scripts live on the head branch, so use those rather than the base
+      # branch's copy. Both trees must be measured by the SAME scripts, or a
+      # change to a script itself shows up as a change in the codebase.
+      - name: Fetch check scripts from head
+        run: |
+          git checkout "${{ github.event.pull_request.head.sha }}" -- .github/ci/
+
+      # The linter config is part of the measurement too. If a PR changes a
+      # rule, both trees must be judged by the new rule, or every file the rule
+      # touches reads as newly broken.
+      #
+      # One `git checkout` per file: a single call listing all of them fails as
+      # a whole when any one path is missing, which would silently leave the
+      # base tree measured by its own older config.
+      - name: Fetch tool configs from head
+        run: |
+          for f in eslint.config.js tsconfig.json tsconfig.app.json tsconfig.node.json; do
+            git checkout "${{ github.event.pull_request.head.sha }}" -- "$f" ||
+              echo "no $f on head, leaving the base copy in place"
+          done
+
+      - name: Static checks
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: bash .github/ci/collect-static.sh /tmp/out/static
+
+      - name: Build
+        id: build
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        continue-on-error: true
+        run: |
+          mkdir -p /tmp/out
+          pnpm build 2>&1 | tee /tmp/out/build.log
+
+      - name: Record the build outcome
+        if: ${{ !cancelled() }}
+        run: |
+          mkdir -p /tmp/out
+          echo "${{ steps.build.outcome }}" >/tmp/out/build.outcome
+
+      - name: Measure bundle
+        if: ${{ steps.build.outcome == 'success' }}
+        run: node .github/ci/measure-bundle.cjs dist /tmp/out/bundle.json
+
+      - uses: actions/upload-artifact@v7
+        if: ${{ !cancelled() }}
+        with:
+          name: tree-base
+          path: /tmp/out/
+          retention-days: 1
+
+  # ── Fan-in: diff, one comment, one verdict ────────────────────────────
+  report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [head, base]
+    if: ${{ always() && github.event_name == 'pull_request' }}
+    permissions:
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with: { name: tree-head, path: /tmp/head }
+        continue-on-error: true
+      - uses: actions/download-artifact@v8
+        with: { name: tree-base, path: /tmp/base }
+        continue-on-error: true
+
+      # The diff happens here, once, over artifacts. Neither tree is present.
+      - name: Render fragments
+        run: |
+          mkdir -p /tmp/fragments
+          cp -r /tmp/head/fragments/. /tmp/fragments/ 2>/dev/null || true
+          node -e "require('./.github/ci/render-build.cjs')({
+            head: '/tmp/head', base: '/tmp/base', out: '/tmp/fragments'
+          })"
+          node -e "require('./.github/ci/render-static.cjs')({
+            head: '/tmp/head/static', base: '/tmp/base/static', out: '/tmp/fragments'
+          })"
+          node -e "require('./.github/ci/render-bundle.cjs')({
+            head: '/tmp/head/bundle.json', base: '/tmp/base/bundle.json', out: '/tmp/fragments'
+          })"
+
+      - name: Post comment
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const { assemble, upsertComment } = require('./.github/ci/comment.cjs')
+            const body = assemble('/tmp/fragments', {
+              id: 'pr-checks',
+              title: '### PR checks',
+              header: `_Compared against \`${context.payload.pull_request.base.ref}\`._`,
+            })
+            core.info(JSON.stringify(await upsertComment(github, context, 'pr-checks', body)))
+
+      # `tee` puts the verdict on the run's summary page, so the reason a
+      # required check went red is visible without opening the log.
+      #
+      # `set -o pipefail` is load-bearing. Without it the pipeline reports
+      # `tee`'s exit status, which is always 0, and the gate never fails the
+      # build however many checks it blocked.
+      - name: Gate
+        run: |
+          set -o pipefail
+          node .github/ci/gate.cjs /tmp/fragments | tee -a "$GITHUB_STEP_SUMMARY"
