@@ -111,7 +111,29 @@ jobs:
         with:
           ref: ${{ github.base_ref }}
 
+      # The toolchain versions are part of the measurement, exactly like the
+      # tool configs below, so both trees take them from head. This step also
+      # covers the bootstrap case: on the PR that first adds `.nvmrc` and the
+      # `packageManager` field, the base branch has neither, and the setup
+      # actions below would fail with nothing to read.
+      #
+      # package.json itself is NOT checked out. It carries the dependency list,
+      # and the base tree must install its own, or `--frozen-lockfile` fails on
+      # every PR that adds a dependency. Only the `packageManager` field is
+      # taken, through a copy that pnpm/action-setup reads instead.
+      - name: Fetch the toolchain versions from head
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          git fetch --no-tags --depth=1 origin "$HEAD_SHA"
+          git checkout "$HEAD_SHA" -- .nvmrc ||
+            echo "no .nvmrc on head, leaving the base copy in place"
+          mkdir -p .ci-toolchain
+          git show "$HEAD_SHA":package.json >.ci-toolchain/package.json
+
       - uses: pnpm/action-setup@v6
+        with:
+          package_json_file: .ci-toolchain/package.json
       - uses: actions/setup-node@v7
         with:
           node-version-file: .nvmrc
@@ -121,12 +143,11 @@ jobs:
         id: install
         run: pnpm install --frozen-lockfile
 
-      # The scripts live on the head branch, so fetch them rather than using the
-      # base branch's copy. Both trees must be measured by the SAME scripts, or
-      # a change to a script itself shows up as a change in the codebase.
+      # The scripts live on the head branch, so use those rather than the base
+      # branch's copy. Both trees must be measured by the SAME scripts, or a
+      # change to a script itself shows up as a change in the codebase.
       - name: Fetch check scripts from head
         run: |
-          git fetch --no-tags --depth=1 origin "${{ github.event.pull_request.head.sha }}"
           git checkout "${{ github.event.pull_request.head.sha }}" -- .github/ci/
 
       # The linter config is part of the measurement too. If a PR changes a
@@ -219,5 +240,11 @@ jobs:
 
       # `tee` puts the verdict on the run's summary page, so the reason a
       # required check went red is visible without opening the log.
+      #
+      # `set -o pipefail` is load-bearing. Without it the pipeline reports
+      # `tee`'s exit status, which is always 0, and the gate never fails the
+      # build however many checks it blocked.
       - name: Gate
-        run: node .github/ci/gate.cjs /tmp/fragments | tee -a "$GITHUB_STEP_SUMMARY"
+        run: |
+          set -o pipefail
+          node .github/ci/gate.cjs /tmp/fragments | tee -a "$GITHUB_STEP_SUMMARY"
